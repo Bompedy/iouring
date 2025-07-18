@@ -7,9 +7,8 @@
 #include <thread>
 #include <vector>
 #include <asm-generic/int-ll64.h>
-#include <sys/eventfd.h>
 #include <linux/io_uring.h>
-
+#include <sys/mman.h>
 
 int io_uring_setup(const unsigned entries, io_uring_params *params) {
     const int ring_fd = syscall(__NR_io_uring_setup, entries, params);
@@ -19,19 +18,180 @@ int io_uring_enter(
     const int ring_fd,
     const unsigned int to_submit,
     const unsigned int min_complete,
-    const unsigned int flags
+    const unsigned int flags,
+    sigset_t *sig,
+    size_t sz
 ) {
-    const int result = syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete, flags, NULL, 0);
+    const int result = syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete, flags, sig, sz);
     return (result < 0) ? -errno : result;
 }
 
 int main(int argc, char *argv[]) {
-    auto params = io_uring_params {};
-    params.sq_thread_idle = 5000;
-    params.flags |= IORING_SETUP_SQPOLL;
-    io_uring_wa
+    struct io_uring_params params = {};
+    // params.sq_thread_idle = 1000;
+    // params.flags |= IORING_SETUP_SQPOLL;
 
-    const auto ring_fd = io_uring_setup(4096, &params);
+    const auto ring_fd = io_uring_setup(32000, &params);
+    if (ring_fd < 0) {
+        perror("io_uring_setup");
+        return 1;
+    }
+
+    const auto sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(__u32);
+    void* sq_ptr = mmap(
+        NULL,
+        sq_ring_size,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_POPULATE,
+        ring_fd,
+        IORING_OFF_SQ_RING
+    );
+    if (sq_ptr == MAP_FAILED) {
+        perror("mmap sq_ring");
+        return 1;
+    }
+
+    const auto sqes_size = params.sq_entries * sizeof(struct io_uring_sqe);
+    auto* sqes = static_cast<struct io_uring_sqe *>(
+        mmap(
+            NULL,
+            sqes_size,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_POPULATE,
+            ring_fd,
+            IORING_OFF_SQES
+            )
+        );
+    if (sqes == MAP_FAILED) {
+        perror("mmap sqes");
+        return 1;
+    }
+
+    const auto cq_ring_size = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
+    const auto cq_ptr = mmap(NULL, cq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd, IORING_OFF_CQ_RING);
+    if (cq_ptr == MAP_FAILED) {
+        perror("mmap cq_ring");
+        return 1;
+    }
+
+    const auto cq_head = reinterpret_cast<std::atomic<uint32_t> *>(static_cast<char *>(sq_ptr) + params.cq_off.head);
+    const auto cq_tail = reinterpret_cast<std::atomic<uint32_t> *>(static_cast<char *>(sq_ptr) + params.cq_off.tail);
+    const auto cq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ptr) + params.cq_off.ring_mask);
+    const auto *cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ptr) + params.cq_off.cqes);
+    std::atomic next_cq_head(cq_tail->load());
+    std::atomic completion_head(cq_tail->load());
+
+    auto process_cqes = [&](const int thread) {
+        std::vector<io_uring_cqe> cqe_copies;
+        while (true) {
+            const auto current_tail = cq_tail->load(std::memory_order_acquire);
+            auto my_head = completion_head.load(std::memory_order_relaxed);
+            unsigned int to_process = 0;
+
+            do {
+                if (my_head == current_tail) {
+                    io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
+                    std::this_thread::yield();
+                    break;
+                }
+
+                to_process = std::min(current_tail - my_head, 100u);
+            } while (!completion_head.compare_exchange_weak(
+                my_head,
+                my_head + to_process,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed));
+
+
+            std::atomic_thread_fence(std::memory_order_acquire);
+            cqe_copies.reserve(to_process);
+            for (unsigned int i = 0; i < to_process; i++) {
+                cqe_copies.emplace_back(cqes[(my_head + i) & *cq_ring_mask]);
+            }
+
+            if (to_process > 0) {
+                while (next_cq_head.load(std::memory_order_acquire) != my_head) {
+                    std::this_thread::yield();
+                }
+
+                cq_head->store(my_head + to_process, std::memory_order_release);
+                next_cq_head.store(my_head + to_process, std::memory_order_release);
+
+                for (const auto cqe_copy : cqe_copies) {
+                    std::cout << "Processing copied CQE with thread=" << thread << " user_data=" << cqe_copy.user_data << std::endl;
+                }
+
+                cqe_copies.clear();
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+
+    for (int i = 0; i < 10; ++i) {
+        workers.emplace_back(process_cqes, i);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+    const auto sq_head = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<char*>(sq_ptr) + params.sq_off.head);
+    const auto sq_tail = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<char*>(sq_ptr) + params.sq_off.tail);
+    const auto sq_ring_mask = reinterpret_cast<uint32_t*>(static_cast<char*>(sq_ptr) + params.sq_off.ring_mask);
+    const auto sq_array = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ptr) + params.sq_off.array);
+
+    auto submit = [&](const int i) {
+        while (true) {
+            auto head = sq_head->load();
+            auto tail = sq_tail->load();
+            if ((tail-head) >= params.sq_entries) {
+                std::cout << "Its full waiting!" << std::endl;
+                io_uring_enter(ring_fd, 0, 0, IORING_ENTER_SQ_WAIT, nullptr, 0);
+                continue;
+            }
+            const auto new_tail = tail + 1;
+            if (!sq_tail->compare_exchange_weak(tail, new_tail, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                continue;
+            }
+
+            const auto index = tail & *sq_ring_mask;
+            const auto sqe = &sqes[index];
+            memset(sqe, 0, sizeof(*sqe));
+            sqe->opcode = IORING_OP_NOP;
+            sqe->user_data = i;
+            sq_array[index] = index;
+            if (params.flags & IORING_SETUP_SQPOLL) {
+                if (std::atomic_ref(params.sq_off.flags).load(std::memory_order_relaxed) & IORING_SQ_NEED_WAKEUP) {
+                    std::cout << "Needed wakeup!" << std::endl;
+                    if (io_uring_enter(ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr, 0) < 0) {
+                        perror("io_uring_enter 1");
+                    }
+                }
+            } else {
+                if (io_uring_enter(ring_fd, 1, 0, 0, nullptr, 0) < 0) {
+                    perror("io_uring_enter 2");
+                }
+            }
+            break;
+        }
+    };
+
+
+    std::vector<std::thread> submitters;
+
+    for (int i = 0; i < 3; ++i) {
+        submitters.emplace_back([submit]() {
+            int i = 0;
+            while (true) {
+                submit(i++);
+            }
+        });
+    }
+
+
+
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(15000));
+
+    close(ring_fd);
 }
 //
 // template<typename T>
