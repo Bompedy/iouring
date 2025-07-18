@@ -26,6 +26,8 @@ int io_uring_enter(
     return (result < 0) ? -errno : result;
 }
 
+const uint32_t OPERATIONS = 1000000;
+
 int main(int argc, char *argv[]) {
     struct io_uring_params params = {};
     // params.sq_thread_idle = 1000;
@@ -81,6 +83,9 @@ int main(int argc, char *argv[]) {
     std::atomic next_cq_head(cq_tail->load());
     std::atomic completion_head(cq_tail->load());
 
+    std::atomic<long> start;
+    std::atomic<uint32_t> submitted{0};
+    std::atomic<uint32_t> completed{0};
     auto process_cqes = [&](const int thread) {
         std::vector<io_uring_cqe> cqe_copies;
         while (true) {
@@ -119,7 +124,9 @@ int main(int argc, char *argv[]) {
 
                 for (const auto cqe_copy : cqe_copies) {
                     // comes back here
-                    std::cout << "Processing copied CQE with thread=" << thread << " user_data=" << cqe_copy.user_data << std::endl;
+
+                    auto count = completed.fetch_add(1);
+                    std::cout << "Recv " << count << std::endl;
                 }
 
                 cqe_copies.clear();
@@ -180,15 +187,39 @@ int main(int argc, char *argv[]) {
     std::vector<std::thread> submitters;
 
     for (int i = 0; i < 3; ++i) {
-        submitters.emplace_back([submit]() {
+        submitters.emplace_back([submit, &submitted, &start]() {
             int i = 0;
             while (true) {
+                auto index = submitted.fetch_add(1);
+                if (index == 0) {
+                    auto now = std::chrono::system_clock::now();
+                    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now.time_since_epoch()
+                    ).count();
+                    start.store(millis);
+                }
+                if (index >= OPERATIONS) break;
+//                std::cout << "Send " << index << std::endl;
                 submit(i++);
             }
         });
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(15000));
+    while (true) {
+        auto count = completed.load();
+        if (count >= OPERATIONS) {
+            auto now = std::chrono::system_clock::now();
+            auto end_millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()
+            ).count();
+            auto start_millis = start.load();
+            auto millis = end_millis - start_millis;
+            auto seconds = (double) millis / 1000.0;
+            auto ops = (double) OPERATIONS / seconds;
+            std::cout << ops << " OP/S, " << OPERATIONS << " operations, " << seconds << " seconds" << std::endl;
+            break;
+        }
+    }
 
     close(ring_fd);
 }
