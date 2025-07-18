@@ -118,6 +118,7 @@ int main(int argc, char *argv[]) {
                 next_cq_head.store(my_head + to_process, std::memory_order_release);
 
                 for (const auto cqe_copy : cqe_copies) {
+                    // comes back here
                     std::cout << "Processing copied CQE with thread=" << thread << " user_data=" << cqe_copy.user_data << std::endl;
                 }
 
@@ -156,6 +157,7 @@ int main(int argc, char *argv[]) {
             const auto sqe = &sqes[index];
             memset(sqe, 0, sizeof(*sqe));
             sqe->opcode = IORING_OP_NOP;
+            // send it here
             sqe->user_data = i;
             sq_array[index] = index;
             if (params.flags & IORING_SETUP_SQPOLL) {
@@ -185,9 +187,6 @@ int main(int argc, char *argv[]) {
             }
         });
     }
-
-
-
 
     std::this_thread::sleep_for(std::chrono::milliseconds(15000));
 
