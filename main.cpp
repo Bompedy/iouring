@@ -1,6 +1,9 @@
+#include <condition_variable>
 #include <iostream>
 #include <coroutine>
 #include <cstring>
+#include <mutex>
+#include <queue>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -26,14 +29,15 @@ int io_uring_enter(
     return (result < 0) ? -errno : result;
 }
 
-const uint32_t OPERATIONS = 1000000;
+const uint32_t OPERATIONS = 10000000;
+const unsigned int WORKER_THREADS = 10;
 
 int main(int argc, char *argv[]) {
     struct io_uring_params params = {};
-    // params.sq_thread_idle = 1000;
+    // params.sq_thread_idle = 50000;
     // params.flags |= IORING_SETUP_SQPOLL;
 
-    const auto ring_fd = io_uring_setup(32000, &params);
+    const auto ring_fd = io_uring_setup(4096, &params);
     if (ring_fd < 0) {
         perror("io_uring_setup");
         return 1;
@@ -80,133 +84,162 @@ int main(int argc, char *argv[]) {
     const auto cq_tail = reinterpret_cast<std::atomic<uint32_t> *>(static_cast<char *>(sq_ptr) + params.cq_off.tail);
     const auto cq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ptr) + params.cq_off.ring_mask);
     const auto *cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ptr) + params.cq_off.cqes);
-    std::atomic next_cq_head(cq_tail->load());
-    std::atomic completion_head(cq_tail->load());
 
-    std::atomic<long> start;
-    std::atomic<uint32_t> submitted{0};
-    std::atomic<uint32_t> completed{0};
-    auto process_cqes = [&](const int thread) {
-        std::vector<io_uring_cqe> cqe_copies;
-        while (true) {
-            const auto current_tail = cq_tail->load(std::memory_order_acquire);
-            auto my_head = completion_head.load(std::memory_order_relaxed);
-            unsigned int to_process = 0;
-
-            do {
-                if (my_head == current_tail) {
-                    io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
-                    std::this_thread::yield();
-                    break;
-                }
-
-                to_process = std::min(current_tail - my_head, 100u);
-            } while (!completion_head.compare_exchange_weak(
-                my_head,
-                my_head + to_process,
-                std::memory_order_acq_rel,
-                std::memory_order_relaxed));
-
-
-            std::atomic_thread_fence(std::memory_order_acquire);
-            cqe_copies.reserve(to_process);
-            for (unsigned int i = 0; i < to_process; i++) {
-                cqe_copies.emplace_back(cqes[(my_head + i) & *cq_ring_mask]);
-            }
-
-            if (to_process > 0) {
-                while (next_cq_head.load(std::memory_order_acquire) != my_head) {
-                    std::this_thread::yield();
-                }
-
-                cq_head->store(my_head + to_process, std::memory_order_release);
-                next_cq_head.store(my_head + to_process, std::memory_order_release);
-
-                for (const auto cqe_copy : cqe_copies) {
-                    // comes back here
-
-                    auto count = completed.fetch_add(1);
-                    std::cout << "Recv " << count << std::endl;
-                }
-
-                cqe_copies.clear();
-            }
-        }
-    };
-
-    std::vector<std::thread> workers;
-
-    for (int i = 0; i < 10; ++i) {
-        workers.emplace_back(process_cqes, i);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
     const auto sq_head = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<char*>(sq_ptr) + params.sq_off.head);
     const auto sq_tail = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<char*>(sq_ptr) + params.sq_off.tail);
     const auto sq_ring_mask = reinterpret_cast<uint32_t*>(static_cast<char*>(sq_ptr) + params.sq_off.ring_mask);
     const auto sq_array = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ptr) + params.sq_off.array);
+    const auto sq_flags = reinterpret_cast<std::atomic<uint32_t> *>(static_cast<char *>(sq_ptr) + params.sq_off.flags);
 
-    auto submit = [&](const int i) {
+
+
+    std::atomic<long> start;
+    std::atomic<uint32_t> submitted{0};
+    std::atomic<uint32_t> completed{0};
+
+    std::vector<std::thread> workers;
+    std::queue<io_uring_cqe> completions;
+    std::mutex completionLock;
+    std::condition_variable completionCv;
+
+    std::mutex submissionLock;
+    std::queue<io_uring_sqe> submissions;
+    std::condition_variable submissionCv;
+
+    std::thread completer([&]() {
         while (true) {
-            auto head = sq_head->load();
-            auto tail = sq_tail->load();
-            if ((tail-head) >= params.sq_entries) {
-                std::cout << "Its full waiting!" << std::endl;
-                io_uring_enter(ring_fd, 0, 0, IORING_ENTER_SQ_WAIT, nullptr, 0);
-                continue;
+            const auto current_head = cq_head->load();
+            const auto current_tail = cq_tail->load();
+
+            if (current_head == current_tail) {
+                io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
+                std::this_thread::yield();
+            } else {
+                const auto to_process = current_tail - current_head;
+                for (unsigned int i = 0; i < to_process; i++) {
+                    {
+                        std::lock_guard lock(completionLock);
+                        completions.push(cqes[(current_head + i) & *cq_ring_mask]);
+                        completionCv.notify_one();
+                    }
+                }
+
+                // completed.fetch_add(to_process);
+
+                // completionCv.notify_one();
+                // completionCv.notify_all();
+                cq_head->fetch_add(to_process);
             }
-            const auto new_tail = tail + 1;
-            if (!sq_tail->compare_exchange_weak(tail, new_tail, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                continue;
+        }
+    });
+
+    for (int i = 0; i < WORKER_THREADS; i++) {
+        workers.emplace_back([&]() {
+            while (true) {
+                {
+                    std::unique_lock<std::mutex> lock(completionLock);
+                    completionCv.wait(lock, [&] { return !completions.empty(); });
+                    io_uring_cqe cqe = completions.front();
+                    completions.pop();
+                    auto count = completed.fetch_add(1);
+                }
+            }
+        });
+    }
+
+    std::thread submitter([&]() {
+        std::vector<io_uring_sqe> to_submit;
+        while (true) {
+            {
+                std::unique_lock lock(submissionLock);
+                submissionCv.wait(lock, [&] { return !submissions.empty(); });
+
+                size_t count = 0;
+                while (!submissions.empty() && count < 64) {
+                   to_submit.push_back(submissions.front());
+                   submissions.pop();
+                   ++count;
+               }
             }
 
-            const auto index = tail & *sq_ring_mask;
-            const auto sqe = &sqes[index];
-            memset(sqe, 0, sizeof(*sqe));
-            sqe->opcode = IORING_OP_NOP;
-            // send it here
-            sqe->user_data = i;
-            sq_array[index] = index;
+            size_t needed = to_submit.size();
+            uint32_t head, tail;
+            while (true) {
+                head = sq_head->load();
+                tail = sq_tail->load();
+
+                if ((tail - head) < params.sq_entries - needed) {
+                    break; // Enough space to submit
+                }
+
+                // Not enough space, wait
+                std::this_thread::yield();
+            }
+
+            for (int i = 0; i < to_submit.size(); i++) {
+                const auto index = (tail + i) & *sq_ring_mask;
+                const auto sqe = &sqes[index];
+                memcpy(sqe, &to_submit[i], sizeof(io_uring_sqe));
+                sq_array[index] = index;
+            }
+
+            sq_tail->store(tail + to_submit.size());
+
             if (params.flags & IORING_SETUP_SQPOLL) {
-                if (std::atomic_ref(params.sq_off.flags).load(std::memory_order_relaxed) & IORING_SQ_NEED_WAKEUP) {
-                    std::cout << "Needed wakeup!" << std::endl;
+                if (sq_flags->load() & IORING_SQ_NEED_WAKEUP) {
                     if (io_uring_enter(ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr, 0) < 0) {
                         perror("io_uring_enter 1");
                     }
                 }
             } else {
-                if (io_uring_enter(ring_fd, 1, 0, 0, nullptr, 0) < 0) {
+                if (io_uring_enter(ring_fd, to_submit.size(), 0, 0, nullptr, 0) < 0) {
                     perror("io_uring_enter 2");
                 }
             }
-            break;
+
+
+            to_submit.clear();
         }
-    };
+    });
 
 
     std::vector<std::thread> submitters;
 
-    for (int i = 0; i < 3; ++i) {
-        submitters.emplace_back([submit, &submitted, &start]() {
-            int i = 0;
+    for (int i = 0; i < 1; ++i) {
+        submitters.emplace_back([&, &submitted, &start]() {
+            int i1 = 0;
             while (true) {
                 auto index = submitted.fetch_add(1);
                 if (index == 0) {
                     auto now = std::chrono::system_clock::now();
                     auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now.time_since_epoch()
+                        now.time_since_epoch()
                     ).count();
                     start.store(millis);
                 }
                 if (index >= OPERATIONS) break;
-//                std::cout << "Send " << index << std::endl;
-                submit(i++);
+                {
+                    io_uring_sqe sqe{};
+                    sqe.opcode = IORING_OP_NOP;
+                    sqe.user_data = i1;
+
+                    std::lock_guard<std::mutex> lock(submissionLock);
+                    submissions.push(sqe);
+                }
+                submissionCv.notify_one();
             }
         });
     }
 
     while (true) {
         auto count = completed.load();
+        std::cout << "\nSubmitted: " << submitted.load() << std::endl;
+        std::cout << "Completed: " << count << std::endl;
+        std::cout << "sq head: " << sq_head->load() << std::endl;
+        std::cout << "sq tail: " << sq_tail->load() << std::endl;
+        std::cout << "cq head: " << cq_head->load() << std::endl;
+        std::cout << "cq tail: " << cq_tail->load() << std::endl;
         if (count >= OPERATIONS) {
             auto now = std::chrono::system_clock::now();
             auto end_millis = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -215,10 +248,12 @@ int main(int argc, char *argv[]) {
             auto start_millis = start.load();
             auto millis = end_millis - start_millis;
             auto seconds = (double) millis / 1000.0;
-            auto ops = (double) OPERATIONS / seconds;
+            auto ops = (int) ((double) OPERATIONS / seconds);
             std::cout << ops << " OP/S, " << OPERATIONS << " operations, " << seconds << " seconds" << std::endl;
             break;
         }
+
+        std::this_thread::yield();
     }
 
     close(ring_fd);
