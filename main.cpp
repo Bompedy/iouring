@@ -19,6 +19,8 @@
 #include <poll.h>
 #include <csignal>
 #include <linux/time_types.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
 
 constexpr auto OPERATIONS = 10000000;
 constexpr auto MAX_SUBMISSION_BATCH = 1000;
@@ -157,7 +159,10 @@ public:
 
         const auto index = tail & *sq_ring_mask_;
         io_uring_sqe* sqe = &sqes_[index];
-        *sqe = *passed;
+//        memset(&sqe, 0, sizeof(sqe));
+        memcpy(&sqes_[index], passed, sizeof(io_uring_sqe));
+
+
         sq_array_[index] = index;
         sq_tail_->store(tail + 1, std::memory_order_release);
 
@@ -364,44 +369,72 @@ concept IsWriteType =
     std::same_as<T, long> ||
     std::same_as<T, char *>;
 
+struct Connection {
+
+};
+
 
 struct ConnectAwaitable : BaseAwaitable {
-    ~ConnectAwaitable()() override = default;
 
     ConnectAwaitable(
         Ring &ring,
         const int client_socket,
         const size_t buffer_size,
         const sockaddr_in addr
-    ) : buffer_size(buffer_size), ring(ring), addr(addr), client_socket(client_socket) {
+    ) : buffer_size(buffer_size), ring(ring), serv_addr(addr), client_socket(client_socket) {
     }
 
     bool await_ready() const noexcept { return false; }
 
     void await_suspend(std::coroutine_handle<> h) {
-        this->coro_handle = h;
-        std::lock_guard guard(*ring_mutex);
-        io_uring_sqe* sqe = io_uring_get_sqe(ring);
-        io_uring_prep_connect(sqe, client_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
-        sqe->user_data = reinterpret_cast<uint64_t>(this);
-        io_uring_submit(ring);
+        std::cout << "Client socket: " << client_socket << std::endl;
+        this->handle = h;
+        io_uring_sqe sqe{};
+        memset(&sqe, 0, sizeof(sqe));
+        sqe.opcode = IORING_OP_CONNECT;
+        sqe.fd = client_socket;
+        sqe.addr = reinterpret_cast<__u64>(reinterpret_cast<sockaddr*>(&serv_addr));
+        sqe.addr_len = 0;
+        sqe.off = reinterpret_cast<uint64_t>(sizeof(serv_addr));
+        sqe.user_data = reinterpret_cast<uint64_t>(this);
+
+        std::cout << "Connect address alignment: "
+                  << (reinterpret_cast<uintptr_t>(&serv_addr) % alignof(sockaddr_in)) << "\n";
+
+        int current_flags = fcntl(client_socket, F_GETFL);
+        if (!(current_flags & O_NONBLOCK)) {
+            std::cerr << "CRITICAL: Socket is blocking despite fcntl!\n";
+            exit(1);
+        }
+
+        int err = 0;
+        socklen_t len = sizeof(err);
+        getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (err != 0) {
+            std::cerr << "Socket has error state: " << strerror(err) << "\n";
+        }
+
+        ring.submit(&sqe);
     }
 
     Connection await_resume() noexcept {
-        return Connection{buffer_size, client_socket, ring};
+        return Connection{};
     }
 
     void on_complete(const int res, const unsigned int flags) override {
         if (res < 0) {
             close(client_socket);
-            throw std::runtime_error(std::string("connect failed: ") + std::strerror(errno));
+            throw std::runtime_error(std::string("connect failed: ") + std::strerror(-res));
         }
+
+        handle.resume();
     }
 
 private:
+    std::coroutine_handle<> handle;
     size_t buffer_size;
     Ring &ring;
-    sockaddr_in addr;
+    sockaddr_in serv_addr;
     int client_socket;
 };
 
@@ -418,25 +451,35 @@ struct AcceptAwaitable : BaseAwaitable {
 
     void await_suspend(std::coroutine_handle<> h) {
         this->handle = h;
-        io_uring_sqe* sqe{};
-        sqe->opcode = IORING_OP_ACCEPT;
-        sqe->ioprio = I
-        io_uring_sqe* sqe = io_uring_get_sqe(ring);
-        io_uring_prep_accept(sqe, server_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr), 0);
-        sqe->user_data = reinterpret_cast<uint64_t>(this);
-        io_uring_submit(ring);
+        io_uring_sqe sqe{};
+        memset(&sqe, 0, sizeof(sqe));
+        sqe.opcode = IORING_OP_ACCEPT;
+//        sqe.ioprio = IORING_ACCEPT_MULTISHOT;
+        sqe.fd = server_socket;
+        const auto addr_len = sizeof(addr);
+        sqe.addr = reinterpret_cast<uintptr_t>(&addr);
+        sqe.off = reinterpret_cast<uint64_t>(&addr_len);
+        sqe.addr_len = 0;  // Must be zero for accept
+        sqe.user_data = reinterpret_cast<uint64_t>(this);
+
+
+        ring.submit(&sqe);
     }
 
     Connection await_resume() noexcept {
-        return Connection{buffer_size, client_socket, ring};
+        return Connection{};
     }
 
     void on_complete(const int res, const unsigned int flags) override {
+        std::cout << "Got the completion!" << std::endl;
         if (res < 0) {
             close(server_socket);
-            throw std::runtime_error(std::string("accept failed: ") + std::strerror(errno));
+            int err = -res;
+            std::cout << res << std::endl;
+            throw std::runtime_error(std::string("accept failed: ") + std::strerror(err));
         }
 
+        std::cout << "Got accept!" << std::endl;
         client_socket = res;
         handle.resume();
     }
@@ -459,36 +502,111 @@ public:
 
     }
 
-    ConnectAwaitable connect(const char* addr, const auto port) {
-        const auto client_socket = socket(AF_INET, SOCK_STREAM, 0);
+    void connect(const char* addr, const auto port) {
+        const auto client_socket = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
         if (client_socket < 0) {
             throw std::runtime_error(std::string("client socket creation failed: ") + std::strerror(errno));
         }
+
+        const auto flags = fcntl(client_socket, F_GETFL, 0);
+        if (flags == -1) throw std::runtime_error("fcntl get flags failed");
+        if (fcntl(client_socket, F_SETFL, flags | O_NONBLOCK) == -1) {
+            throw std::runtime_error("fcntl set O_NONBLOCK failed");
+        }
+
+        const auto flag = 1;
+        if (setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag)) < 0) {
+            throw std::runtime_error("setsockopt TCP_NODELAY failed");
+        }
+
         sockaddr_in serv_addr{};
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_port = htons(port);
-        inet_pton(AF_INET, addr, &serv_addr.sin_addr);
-        return ConnectAwaitable{ring_, client_socket, buffer_size_, serv_addr};
+        if (inet_pton(AF_INET, addr, &serv_addr.sin_addr) <= 0) {
+            throw std::runtime_error("invalid IP address");
+        }
+
+        int ret = ::connect(client_socket, reinterpret_cast<sockaddr*>(&serv_addr), sizeof(serv_addr));
+        if (ret < 0) {
+            if (errno == EINPROGRESS) {
+                std::cerr << "connect() in progress (EINPROGRESS), non-blocking socket.\n";
+                // Good, expected for non-blocking sockets
+            } else {
+                std::cerr << "connect() syscall failed: " << std::strerror(errno) << "\n";
+                close(client_socket);
+                return;
+            }
+        } else {
+            std::cout << "connect() succeeded immediately!\n";
+        }
+
+//        close(client_socket);
+
+//        return ConnectAwaitable{ring_, client_socket, buffer_size_, serv_addr};
     }
 
-    AcceptAwaitable accept(const sockaddr_in &addr) {
-        const auto server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    AcceptAwaitable accept(const char* addr, const auto port) {
+        sockaddr_in serv_addr{};
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(port);
+        if (inet_pton(AF_INET, addr, &serv_addr.sin_addr) <= 0) {
+            throw std::runtime_error("invalid IP address");
+        }
+
+        const auto server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (server_socket < 0) {
             throw std::runtime_error(std::string("server socket creation failed: ") + std::strerror(errno));
         }
+//
+//        const auto flags = fcntl(server_socket, F_GETFL, 0);
+//        if (flags == -1) throw std::runtime_error("fcntl get flags failed");
+//        if (fcntl(server_socket, F_SETFL, flags | O_NONBLOCK) == -1) {
+//            throw std::runtime_error("fcntl set O_NONBLOCK failed");
+//        }
+//
+//        const auto flag = 1;
+//        if (setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag)) < 0) {
+//            throw std::runtime_error("setsockopt TCP_NODELAY failed");
+//        }
 
-        const auto bind = bind(server_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
-        if (bind < 0) {
+        const auto bind_result = bind(server_socket, reinterpret_cast<const sockaddr *>(&serv_addr), sizeof(serv_addr));
+        if (bind_result < 0) {
             throw std::runtime_error(std::string("server bind failed: ") + std::strerror(errno));
         }
-
         if (listen(server_socket, SOMAXCONN) < 0) {
             throw std::runtime_error(std::string("server listen failed: ") + std::strerror(errno));
         }
 
-        return AcceptAwaitable(ring_, server_socket, buffer_size_, addr);
+        std::cout << "Going to awaitable" << std::endl;
+        return AcceptAwaitable { ring_, server_socket, buffer_size_, serv_addr };
     }
 };
+
+//Task client(Ring& ring, Provider& provider, const char* addr, const auto port) {
+//    try {
+//        // co_await your connect awaitable
+//        std::cout << "Now connecting" << std::endl;
+//        auto connection = co_await provider.connect(addr, port);
+//        std::cout << "Connected to server!\n";
+//        co_await Delay { ring, std::chrono::milliseconds(5000) };
+//        // Use connection ...
+//    } catch (const std::exception& e) {
+//        std::cerr << "Connect failed: " << e.what() << '\n';
+//    }
+//}
+
+Task server(Ring& ring, Provider& provider, const char* addr, const auto port) {
+
+    try {
+        std::cout << "Waiting for connection?" << std::endl;
+        auto accepted = co_await provider.accept(addr, port);
+        std::cout << "Accepted connection!\n";
+        co_await Delay { ring, std::chrono::milliseconds(5000) };
+        // Use accepted connection ...
+    } catch (const std::exception& e) {
+        std::cerr << "Accept failed: " << e.what() << '\n';
+    }
+}
 
 int main(int argc, char* argv[]) {
     setup_signal_handlers();
@@ -502,7 +620,9 @@ int main(int argc, char* argv[]) {
 
     // benchmark(ring, 1000000);
     auto provider = Provider(ring, 65535);
-
+    server(ring, provider, "127.0.0.1", 6969);
+    provider.connect("127.0.0.1", 6969);
+//    client(ring, provider, "127.0.0.1", 6981);
 
     ring.start();
 
@@ -644,10 +764,10 @@ int main(int argc, char* argv[]) {
 //     ConnectAwaitable(
 //         const int client_socket,
 //         const size_t buffer_size,
-//         const sockaddr_in addr,
+//         const sockaddr_in serv_addr,
 //         io_uring *ring,
 //         std::mutex *ring_mutex
-//     ) : buffer_size(buffer_size), ring(ring), addr(addr), client_socket(client_socket) {
+//     ) : buffer_size(buffer_size), ring(ring), serv_addr(serv_addr), client_socket(client_socket) {
 //     }
 //
 //     bool await_ready() const noexcept { return false; }
@@ -656,7 +776,7 @@ int main(int argc, char* argv[]) {
 //         this->coro_handle = h;
 //         std::lock_guard guard(*ring_mutex);
 //         io_uring_sqe* sqe = io_uring_get_sqe(ring);
-//         io_uring_prep_connect(sqe, client_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+//         io_uring_prep_connect(sqe, client_socket, reinterpret_cast<sockaddr *>(&serv_addr), sizeof(serv_addr));
 //         sqe->user_data = reinterpret_cast<uint64_t>(this);
 //         io_uring_submit(ring);
 //     }
@@ -676,7 +796,7 @@ int main(int argc, char* argv[]) {
 //     std::mutex *ring_mutex;
 //     size_t buffer_size;
 //     io_uring* ring;
-//     sockaddr_in addr;
+//     sockaddr_in serv_addr;
 //     int client_socket;
 // };
 //
@@ -686,10 +806,10 @@ int main(int argc, char* argv[]) {
 //     AcceptAwaitable(
 //         const int server_socket,
 //         const size_t buffer_size,
-//         const sockaddr_in addr,
+//         const sockaddr_in serv_addr,
 //         io_uring *ring,
 //         std::mutex *mutex
-//     ) : buffer_size(buffer_size), ring(ring), addr(addr), server_socket(server_socket) {
+//     ) : buffer_size(buffer_size), ring(ring), serv_addr(serv_addr), server_socket(server_socket) {
 //     }
 //
 //     bool await_ready() const noexcept { return false; }
@@ -698,7 +818,7 @@ int main(int argc, char* argv[]) {
 //         this->coro_handle = h;
 //         std::lock_guard guard(*ring_mutex);
 //         io_uring_sqe* sqe = io_uring_get_sqe(ring);
-//         io_uring_prep_accept(sqe, server_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr), 0);
+//         io_uring_prep_accept(sqe, server_socket, reinterpret_cast<sockaddr *>(&serv_addr), sizeof(serv_addr), 0);
 //         sqe->user_data = reinterpret_cast<uint64_t>(this);
 //         io_uring_submit(ring);
 //     }
@@ -721,7 +841,7 @@ int main(int argc, char* argv[]) {
 //     std::mutex* ring_mutex;
 //     size_t buffer_size;
 //     io_uring* ring;
-//     sockaddr_in addr;
+//     sockaddr_in serv_addr;
 //     int server_socket, client_socket;
 // };
 //
@@ -784,7 +904,7 @@ int main(int argc, char* argv[]) {
 //         io_uring_queue_exit(&ring);
 //     }
 //
-//     ConnectAwaitable connect(const char* addr, const auto port) {
+//     ConnectAwaitable connect(const char* serv_addr, const auto port) {
 //         const auto client_socket = socket(AF_INET, SOCK_STREAM, 0);
 //         if (client_socket < 0) {
 //             throw std::runtime_error(std::string("client socket creation failed: ") + std::strerror(errno));
@@ -792,17 +912,17 @@ int main(int argc, char* argv[]) {
 //         sockaddr_in serv_addr{};
 //         serv_addr.sin_family = AF_INET;
 //         serv_addr.sin_port = htons(port);
-//         inet_pton(AF_INET, addr, &serv_addr.sin_addr);
+//         inet_pton(AF_INET, serv_addr, &serv_addr.sin_addr);
 //         return ConnectAwaitable{client_socket, buffer_size, serv_addr, &ring, &ring_mutex};
 //     }
 //
-//     AcceptAwaitable accept(const sockaddr_in &addr) {
+//     AcceptAwaitable accept(const sockaddr_in &serv_addr) {
 //         const auto server_socket = socket(AF_INET, SOCK_STREAM, 0);
 //         if (server_socket < 0) {
 //             throw std::runtime_error(std::string("server socket creation failed: ") + std::strerror(errno));
 //         }
 //
-//         const auto bind = bind(server_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+//         const auto bind = bind(server_socket, reinterpret_cast<sockaddr *>(&serv_addr), sizeof(serv_addr));
 //         if (bind < 0) {
 //             throw std::runtime_error(std::string("server bind failed: ") + std::strerror(errno));
 //         }
@@ -811,7 +931,7 @@ int main(int argc, char* argv[]) {
 //             throw std::runtime_error(std::string("server listen failed: ") + std::strerror(errno));
 //         }
 //
-//         return AcceptAwaitable{server_socket, buffer_size, addr, &ring, &ring_mutex};
+//         return AcceptAwaitable{server_socket, buffer_size, serv_addr, &ring, &ring_mutex};
 //     }
 // };
 //
