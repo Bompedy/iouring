@@ -12,6 +12,35 @@
 #include <asm-generic/int-ll64.h>
 #include <linux/io_uring.h>
 #include <sys/mman.h>
+#include <fcntl.h>   // for open()
+#include <functional>
+#include <unistd.h>  // for close()
+#include <sys/eventfd.h>
+#include <poll.h>
+#include <csignal>
+#include <linux/time_types.h>
+
+constexpr auto OPERATIONS = 10000000;
+constexpr auto MAX_SUBMISSION_BATCH = 1000;
+constexpr unsigned long EVENTFD_EXIT = 0xDEADBEEF;
+constexpr unsigned long EVENTFD_WAKE = 0xBEEFDEAD;
+auto RUNNING = std::atomic(true);
+
+
+void handle_signal(int signum) {
+    std::cout << "\nReceived signal " << signum << ", shutting down..." << std::endl;
+    RUNNING.store(false);
+}
+
+void setup_signal_handlers() {
+    struct sigaction sa{};
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    sigaction(SIGINT, &sa, nullptr);   // Ctrl+C
+    sigaction(SIGTERM, &sa, nullptr);  // kill
+}
 
 int io_uring_setup(const unsigned entries, io_uring_params *params) {
     const int ring_fd = syscall(__NR_io_uring_setup, entries, params);
@@ -28,235 +57,456 @@ int io_uring_enter(
     const int result = syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete, flags, sig, sz);
     return (result < 0) ? -errno : result;
 }
+int io_uring_register(unsigned int ring_fd, unsigned int op, void *arg, unsigned int nr_args) {
+    const int result = syscall(__NR_io_uring_register, ring_fd, op, arg, nr_args);
+    return (result < 0) ? -errno : result;
+}
 
-const uint32_t OPERATIONS = 10000000;
-const unsigned int WORKER_THREADS = 10;
 
-int main(int argc, char *argv[]) {
-    struct io_uring_params params = {};
-    // params.sq_thread_idle = 50000;
-    // params.flags |= IORING_SETUP_SQPOLL;
+struct BaseAwaitable {
+    virtual void on_complete(const int res, const unsigned int flags) {}
+    virtual ~BaseAwaitable() = default;
+};
 
-    const auto ring_fd = io_uring_setup(4096, &params);
-    if (ring_fd < 0) {
-        perror("io_uring_setup");
-        return 1;
+struct Task {
+    struct promise_type {
+        Task get_return_object() { return {}; }  // No handle needed
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() {}
+        void unhandled_exception() { std::terminate(); }
+    };
+};
+
+template <typename F>
+concept Predicate = requires(F f, int i) {
+    { f(i) } -> std::same_as<bool>;
+};
+
+
+class Ring {
+public:
+    explicit Ring(io_uring_params& params) {
+        fd_ = io_uring_setup(32000, &params);
+        if (fd_ < 0) throw std::runtime_error("io_uring_setup failed");
+        params_ = params;
+        sq_ring_size_ = params.sq_off.array + params.sq_entries * sizeof(__u32);
+        sq_ptr_ = mmap(nullptr, sq_ring_size_, PROT_READ | PROT_WRITE,MAP_SHARED | MAP_POPULATE, fd_, IORING_OFF_SQ_RING);
+        if (sq_ptr_ == MAP_FAILED) throw std::runtime_error("mmap SQ ring failed");
+        sqes_size_ = params.sq_entries * sizeof(io_uring_sqe);
+        sqes_ = static_cast<io_uring_sqe*>(mmap(nullptr, sqes_size_, PROT_READ | PROT_WRITE,MAP_SHARED | MAP_POPULATE, fd_, IORING_OFF_SQES));
+        if (sqes_ == MAP_FAILED) throw std::runtime_error("mmap SQEs failed");
+        cq_ring_size_ = params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe);
+        cq_ptr_ = mmap(nullptr, cq_ring_size_, PROT_READ | PROT_WRITE,MAP_SHARED | MAP_POPULATE, fd_, IORING_OFF_CQ_RING);
+        if (cq_ptr_ == MAP_FAILED) throw std::runtime_error("mmap CQ ring failed");
+        sq_head_ = reinterpret_cast<std::atomic<uint32_t>*>((char*)sq_ptr_ + params.sq_off.head);
+        sq_tail_ = reinterpret_cast<std::atomic<uint32_t>*>((char*)sq_ptr_ + params.sq_off.tail);
+        sq_flags_ = reinterpret_cast<std::atomic<uint32_t>*>((char*)sq_ptr_ + params.sq_off.flags);
+        sq_ring_mask_ = reinterpret_cast<uint32_t*>((char*)sq_ptr_ + params.sq_off.ring_mask);
+        sq_array_ = reinterpret_cast<uint32_t*>((char*)sq_ptr_ + params.sq_off.array);
+        cq_head_ = reinterpret_cast<std::atomic<uint32_t>*>((char*)cq_ptr_ + params.cq_off.head);
+        cq_tail_ = reinterpret_cast<std::atomic<uint32_t>*>((char*)cq_ptr_ + params.cq_off.tail);
+        cq_ring_mask_ = reinterpret_cast<uint32_t*>((char*)cq_ptr_ + params.cq_off.ring_mask);
+        cqes_ = reinterpret_cast<io_uring_cqe*>((char*)cq_ptr_ + params.cq_off.cqes);
     }
 
-    const auto sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(__u32);
-    void* sq_ptr = mmap(
-        NULL,
-        sq_ring_size,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED | MAP_POPULATE,
-        ring_fd,
-        IORING_OFF_SQ_RING
-    );
-    if (sq_ptr == MAP_FAILED) {
-        perror("mmap sq_ring");
-        return 1;
+    ~Ring() {
+        if (sq_ptr_) munmap(sq_ptr_, sq_ring_size_);
+        if (sqes_) munmap(sqes_, sqes_size_);
+        if (cq_ptr_) munmap(cq_ptr_, cq_ring_size_);
+        if (fd_ >= 0) close(fd_);
     }
 
-    const auto sqes_size = params.sq_entries * sizeof(struct io_uring_sqe);
-    auto* sqes = static_cast<struct io_uring_sqe *>(
-        mmap(
-            NULL,
-            sqes_size,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_POPULATE,
-            ring_fd,
-            IORING_OFF_SQES
-            )
-        );
-    if (sqes == MAP_FAILED) {
-        perror("mmap sqes");
-        return 1;
-    }
+    void start() const {
+        while (RUNNING.load(std::memory_order_acquire)) {
+            const auto current_head = cq_head_->load(std::memory_order_acquire);
+            const auto current_tail = cq_tail_->load(std::memory_order_acquire);
+            auto to_process = current_tail - current_head;
 
-    const auto cq_ring_size = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
-    const auto cq_ptr = mmap(NULL, cq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd, IORING_OFF_CQ_RING);
-    if (cq_ptr == MAP_FAILED) {
-        perror("mmap cq_ring");
-        return 1;
-    }
+            if (to_process == 0) {
+                io_uring_enter(fd_, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
+                to_process = cq_tail_->load(std::memory_order_acquire) - cq_head_->load(std::memory_order_acquire);
+            }
 
-    const auto cq_head = reinterpret_cast<std::atomic<uint32_t> *>(static_cast<char *>(sq_ptr) + params.cq_off.head);
-    const auto cq_tail = reinterpret_cast<std::atomic<uint32_t> *>(static_cast<char *>(sq_ptr) + params.cq_off.tail);
-    const auto cq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ptr) + params.cq_off.ring_mask);
-    const auto *cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ptr) + params.cq_off.cqes);
-
-
-    const auto sq_head = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<char*>(sq_ptr) + params.sq_off.head);
-    const auto sq_tail = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<char*>(sq_ptr) + params.sq_off.tail);
-    const auto sq_ring_mask = reinterpret_cast<uint32_t*>(static_cast<char*>(sq_ptr) + params.sq_off.ring_mask);
-    const auto sq_array = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ptr) + params.sq_off.array);
-    const auto sq_flags = reinterpret_cast<std::atomic<uint32_t> *>(static_cast<char *>(sq_ptr) + params.sq_off.flags);
-
-
-
-    std::atomic<long> start;
-    std::atomic<uint32_t> submitted{0};
-    std::atomic<uint32_t> completed{0};
-
-    std::vector<std::thread> workers;
-    std::queue<io_uring_cqe> completions;
-    std::mutex completionLock;
-    std::condition_variable completionCv;
-
-    std::mutex submissionLock;
-    std::queue<io_uring_sqe> submissions;
-    std::condition_variable submissionCv;
-
-    std::thread completer([&]() {
-        while (true) {
-            const auto current_head = cq_head->load();
-            const auto current_tail = cq_tail->load();
-
-            if (current_head == current_tail) {
-                io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
-                std::this_thread::yield();
-            } else {
-                const auto to_process = current_tail - current_head;
-                for (unsigned int i = 0; i < to_process; i++) {
-                    {
-                        std::lock_guard lock(completionLock);
-                        completions.push(cqes[(current_head + i) & *cq_ring_mask]);
-                        completionCv.notify_one();
+            if (to_process > 0) {
+                for (unsigned int i = 0; i < to_process; ++i) {
+                    if (const auto& cq = cqes_[(current_head + i) & *cq_ring_mask_]; cq.user_data == EVENTFD_EXIT) {
+                        RUNNING.store(false, std::memory_order_release);
+                    } else {
+                        if (const auto base = reinterpret_cast<BaseAwaitable*>(cq.user_data)) {
+                            base->on_complete(cq.res, cq.flags);
+                        } else {
+                            throw std::runtime_error("Got a non base awaitable error!");
+                        }
                     }
                 }
 
-                // completed.fetch_add(to_process);
-
-                // completionCv.notify_one();
-                // completionCv.notify_all();
-                cq_head->fetch_add(to_process);
+                cq_head_->fetch_add(to_process, std::memory_order_release);
             }
         }
-    });
 
-    for (int i = 0; i < WORKER_THREADS; i++) {
-        workers.emplace_back([&]() {
-            while (true) {
-                {
-                    std::unique_lock<std::mutex> lock(completionLock);
-                    completionCv.wait(lock, [&] { return !completions.empty(); });
-                    io_uring_cqe cqe = completions.front();
-                    completions.pop();
-                    auto count = completed.fetch_add(1);
-                }
-            }
-        });
+        std::cout << "Broke out of here?" << std::endl;
     }
 
-    std::thread submitter([&]() {
-        std::vector<io_uring_sqe> to_submit;
-        while (true) {
-            {
-                std::unique_lock lock(submissionLock);
-                submissionCv.wait(lock, [&] { return !submissions.empty(); });
+    void submit(const io_uring_sqe* passed) const {
+        const unsigned int head = sq_head_->load(std::memory_order_acquire);
+        const unsigned int tail = sq_tail_->load(std::memory_order_relaxed);
+        const unsigned int used = tail - head;
+        const unsigned int space = params_.sq_entries - used;
+        if (space == 0) throw std::runtime_error("ran out of ring space!");
 
-                size_t count = 0;
-                while (!submissions.empty() && count < 64) {
-                   to_submit.push_back(submissions.front());
-                   submissions.pop();
-                   ++count;
-               }
-            }
+        const auto index = tail & *sq_ring_mask_;
+        io_uring_sqe* sqe = &sqes_[index];
+        *sqe = *passed;
+        sq_array_[index] = index;
+        sq_tail_->store(tail + 1, std::memory_order_release);
 
-            size_t needed = to_submit.size();
-            uint32_t head, tail;
-            while (true) {
-                head = sq_head->load();
-                tail = sq_tail->load();
-
-                if ((tail - head) < params.sq_entries - needed) {
-                    break; // Enough space to submit
-                }
-
-                // Not enough space, wait
-                std::this_thread::yield();
-            }
-
-            for (int i = 0; i < to_submit.size(); i++) {
-                const auto index = (tail + i) & *sq_ring_mask;
-                const auto sqe = &sqes[index];
-                memcpy(sqe, &to_submit[i], sizeof(io_uring_sqe));
-                sq_array[index] = index;
-            }
-
-            sq_tail->store(tail + to_submit.size());
-
-            if (params.flags & IORING_SETUP_SQPOLL) {
-                if (sq_flags->load() & IORING_SQ_NEED_WAKEUP) {
-                    if (io_uring_enter(ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr, 0) < 0) {
-                        perror("io_uring_enter 1");
-                    }
-                }
-            } else {
-                if (io_uring_enter(ring_fd, to_submit.size(), 0, 0, nullptr, 0) < 0) {
-                    perror("io_uring_enter 2");
+        if (params_.flags & IORING_SETUP_SQPOLL) {
+            if (sq_flags_->load(std::memory_order_acquire) & IORING_SQ_NEED_WAKEUP) {
+                if (io_uring_enter(fd_, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr, 0) < 0) {
+                    throw std::runtime_error("io_uring_enter failed");
                 }
             }
-
-
-            to_submit.clear();
+        } else if (io_uring_enter(fd_, 1, 0, 0, nullptr, 0)) {
+            throw std::runtime_error("io_uring_enter failed");
         }
-    });
-
-
-    std::vector<std::thread> submitters;
-
-    for (int i = 0; i < 1; ++i) {
-        submitters.emplace_back([&, &submitted, &start]() {
-            int i1 = 0;
-            while (true) {
-                auto index = submitted.fetch_add(1);
-                if (index == 0) {
-                    auto now = std::chrono::system_clock::now();
-                    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now.time_since_epoch()
-                    ).count();
-                    start.store(millis);
-                }
-                if (index >= OPERATIONS) break;
-                {
-                    io_uring_sqe sqe{};
-                    sqe.opcode = IORING_OP_NOP;
-                    sqe.user_data = i1;
-
-                    std::lock_guard<std::mutex> lock(submissionLock);
-                    submissions.push(sqe);
-                }
-                submissionCv.notify_one();
-            }
-        });
     }
 
+    template<typename... Sqes>
+    requires (std::same_as<Sqes, io_uring_sqe*> && ...)
+    void submit_batch(const Sqes&... sqes_batch) const {
+        const unsigned int head = sq_head_->load(std::memory_order_acquire);
+        const unsigned int tail = sq_tail_->load(std::memory_order_relaxed);
+        const unsigned int used = tail - head;
+        const unsigned int space = params_.sq_entries - used;
+        constexpr auto batch_size = sizeof...(sqes_batch);
+
+        if (batch_size > space) {
+            throw std::runtime_error("Not enough space in SQ ring for batch submission");
+        }
+
+        unsigned int i = 0;
+        (void) std::initializer_list<int>{
+            ([&] {
+                const auto index = (tail + i) & *sq_ring_mask_;
+                sqes_[index] = *sqes_batch;
+                sq_array_[index] = index;
+                return i++;
+            }(), 0)...
+        };
+        sq_tail_->store(tail + batch_size, std::memory_order_release);
+
+        if (params_.flags & IORING_SETUP_SQPOLL) {
+            if (sq_flags_->load(std::memory_order_acquire) & IORING_SQ_NEED_WAKEUP) {
+                if (io_uring_enter(fd_, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr, 0) < 0) {
+                    throw std::runtime_error("io_uring_enter failed");
+                }
+            }
+        } else {
+            if (io_uring_enter(fd_, batch_size, 0, 0, nullptr, 0) < 0) {
+                throw std::runtime_error("io_uring_enter failed");
+            }
+        }
+    }
+
+    // --- Public Getters (Read-only) ---
+    [[nodiscard]] int fd() const { return fd_; }
+    [[nodiscard]] const io_uring_params& params() const { return params_; }
+    [[nodiscard]] const io_uring_cqe* cqes() const { return cqes_; }
+    [[nodiscard]] std::atomic<uint32_t>* cq_head() const { return cq_head_; }
+    [[nodiscard]] std::atomic<uint32_t>* cq_tail() const { return cq_tail_; }
+    [[nodiscard]] const uint32_t* cq_ring_mask() const { return cq_ring_mask_; }
+
+private:
+
+    int fd_ = -1;
+    io_uring_params params_{};
+
+    // SQ
+    void* sq_ptr_ = nullptr;
+    io_uring_sqe* sqes_ = nullptr;
+    std::atomic<uint32_t>* sq_head_ = nullptr;
+    std::atomic<uint32_t>* sq_tail_ = nullptr;
+    std::atomic<uint32_t>* sq_flags_ = nullptr;
+    uint32_t* sq_ring_mask_ = nullptr;
+    uint32_t* sq_array_ = nullptr;
+
+    // CQ
+    void* cq_ptr_ = nullptr;
+    std::atomic<uint32_t>* cq_head_ = nullptr;
+    std::atomic<uint32_t>* cq_tail_ = nullptr;
+    uint32_t* cq_ring_mask_ = nullptr;
+    io_uring_cqe* cqes_ = nullptr;
+
+    // Sizes
+    size_t sq_ring_size_ = 0;
+    size_t sqes_size_ = 0;
+    size_t cq_ring_size_ = 0;
+};
+
+struct Delay : BaseAwaitable {
+    template<typename Rep, typename Period>
+    Delay(Ring &ring, std::chrono::duration<Rep, Period> duration): ring_(ring) {
+        const auto ms = duration_cast<std::chrono::milliseconds>(duration).count();
+        ts_.tv_sec = ms / 1000;
+        ts_.tv_nsec = (ms % 1000) * 1'000'000;
+    }
+
+    bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> h) {
+        h_ = h;
+        io_uring_sqe sqe{};
+        memset(&sqe, 0, sizeof(sqe));
+        sqe.opcode = IORING_OP_TIMEOUT;
+        sqe.addr = reinterpret_cast<uint64_t>(&ts_);
+        sqe.len = 1;
+        sqe.user_data = reinterpret_cast<uint64_t>(this);
+        ring_.submit(&sqe);
+    }
+
+    void on_complete(const int res, const unsigned int flags) override {
+        h_.resume();
+    }
+
+    void await_resume() noexcept {
+    }
+
+private:
+    Ring &ring_;
+    __kernel_timespec ts_{};
+    std::coroutine_handle<> h_;
+};
+
+struct NoOp : BaseAwaitable {
+    explicit NoOp(Ring &ring): ring_(ring) {
+
+    }
+
+    bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> h) {
+        h_ = h;
+        io_uring_sqe sqe{};
+        memset(&sqe, 0, sizeof(sqe));
+        sqe.opcode = IORING_OP_NOP;
+        sqe.user_data = reinterpret_cast<uint64_t>(this);
+        ring_.submit(&sqe);
+    }
+
+    void on_complete(const int res, const unsigned int flags) override {
+        h_.resume();
+    }
+
+    void await_resume() noexcept {
+    }
+
+private:
+    Ring &ring_;
+    __kernel_timespec ts_{};
+    std::coroutine_handle<> h_;
+};
+
+Task after(Ring &ring, const std::chrono::milliseconds delay, const std::function<void()> &block) {
+    co_await Delay{ring, delay};
+    block();
+}
+
+
+template<Predicate Function>
+Task every(Ring &ring, std::chrono::milliseconds interval, Function block) {
+    int count = 0;
     while (true) {
-        auto count = completed.load();
-        std::cout << "\nSubmitted: " << submitted.load() << std::endl;
-        std::cout << "Completed: " << count << std::endl;
-        std::cout << "sq head: " << sq_head->load() << std::endl;
-        std::cout << "sq tail: " << sq_tail->load() << std::endl;
-        std::cout << "cq head: " << cq_head->load() << std::endl;
-        std::cout << "cq tail: " << cq_tail->load() << std::endl;
-        if (count >= OPERATIONS) {
-            auto now = std::chrono::system_clock::now();
-            auto end_millis = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now.time_since_epoch()
-            ).count();
-            auto start_millis = start.load();
-            auto millis = end_millis - start_millis;
-            auto seconds = (double) millis / 1000.0;
-            auto ops = (int) ((double) OPERATIONS / seconds);
-            std::cout << ops << " OP/S, " << OPERATIONS << " operations, " << seconds << " seconds" << std::endl;
-            break;
-        }
+        co_await Delay{ring, interval};
+        if (block(count++)) break;
+    }
+}
 
-        std::this_thread::yield();
+Task benchmark(Ring& ring, int ops) {
+    using Clock = std::chrono::high_resolution_clock;
+    const auto start = Clock::now();
+
+    int i = 0;
+    while (i++ < ops) {
+        co_await NoOp{ring};
     }
 
-    close(ring_fd);
+    const auto end = Clock::now();
+    const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    const double ns_per_op = static_cast<double>(duration.count()) / ops;
+    const double ops_per_sec = 1e9 / ns_per_op;
+
+    std::cout << "Benchmark results:\n"
+              << "  Operations:     " << ops << "\n"
+              << "  Total time:     " << duration.count() << " ns\n"
+              << "  Time per op:    " << ns_per_op << " ns\n"
+              << "  Throughput:     " << ops_per_sec << " ops/sec\n";
+}
+
+
+template<typename T>
+concept IsReadType =
+        std::same_as<T, int> ||
+        std::same_as<T, short> ||
+        std::same_as<T, char> ||
+        std::same_as<T, float> ||
+        std::same_as<T, double> ||
+        std::same_as<T, long> ||
+        std::same_as<T, char *>;
+
+template<typename T>
+concept IsWriteType =
+    std::same_as<T, int> ||
+    std::same_as<T, short> ||
+    std::same_as<T, char> ||
+    std::same_as<T, float> ||
+    std::same_as<T, double> ||
+    std::same_as<T, long> ||
+    std::same_as<T, char *>;
+
+
+struct ConnectAwaitable : BaseAwaitable {
+    ~ConnectAwaitable()() override = default;
+
+    ConnectAwaitable(
+        Ring &ring,
+        const int client_socket,
+        const size_t buffer_size,
+        const sockaddr_in addr
+    ) : buffer_size(buffer_size), ring(ring), addr(addr), client_socket(client_socket) {
+    }
+
+    bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> h) {
+        this->coro_handle = h;
+        std::lock_guard guard(*ring_mutex);
+        io_uring_sqe* sqe = io_uring_get_sqe(ring);
+        io_uring_prep_connect(sqe, client_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+        sqe->user_data = reinterpret_cast<uint64_t>(this);
+        io_uring_submit(ring);
+    }
+
+    Connection await_resume() noexcept {
+        return Connection{buffer_size, client_socket, ring};
+    }
+
+    void on_complete(const int res, const unsigned int flags) override {
+        if (res < 0) {
+            close(client_socket);
+            throw std::runtime_error(std::string("connect failed: ") + std::strerror(errno));
+        }
+    }
+
+private:
+    size_t buffer_size;
+    Ring &ring;
+    sockaddr_in addr;
+    int client_socket;
+};
+
+struct AcceptAwaitable : BaseAwaitable {
+    AcceptAwaitable(
+        Ring& ring,
+        const int server_socket,
+        const size_t buffer_size,
+        const sockaddr_in addr
+    ) : buffer_size(buffer_size), ring(ring), addr(addr), server_socket(server_socket) {
+    }
+
+    bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> h) {
+        this->handle = h;
+        io_uring_sqe* sqe{};
+        sqe->opcode = IORING_OP_ACCEPT;
+        sqe->ioprio = I
+        io_uring_sqe* sqe = io_uring_get_sqe(ring);
+        io_uring_prep_accept(sqe, server_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr), 0);
+        sqe->user_data = reinterpret_cast<uint64_t>(this);
+        io_uring_submit(ring);
+    }
+
+    Connection await_resume() noexcept {
+        return Connection{buffer_size, client_socket, ring};
+    }
+
+    void on_complete(const int res, const unsigned int flags) override {
+        if (res < 0) {
+            close(server_socket);
+            throw std::runtime_error(std::string("accept failed: ") + std::strerror(errno));
+        }
+
+        client_socket = res;
+        handle.resume();
+    }
+
+private:
+    std::coroutine_handle<> handle;
+    size_t buffer_size;
+    Ring &ring;
+    sockaddr_in addr;
+    int server_socket, client_socket;
+};
+
+class Provider {
+
+    Ring& ring_;
+    size_t buffer_size_;
+
+public:
+    Provider(Ring& ring, const size_t buffer_size): ring_(ring), buffer_size_(buffer_size) {
+
+    }
+
+    ConnectAwaitable connect(const char* addr, const auto port) {
+        const auto client_socket = socket(AF_INET, SOCK_STREAM, 0);
+        if (client_socket < 0) {
+            throw std::runtime_error(std::string("client socket creation failed: ") + std::strerror(errno));
+        }
+        sockaddr_in serv_addr{};
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(port);
+        inet_pton(AF_INET, addr, &serv_addr.sin_addr);
+        return ConnectAwaitable{ring_, client_socket, buffer_size_, serv_addr};
+    }
+
+    AcceptAwaitable accept(const sockaddr_in &addr) {
+        const auto server_socket = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_socket < 0) {
+            throw std::runtime_error(std::string("server socket creation failed: ") + std::strerror(errno));
+        }
+
+        const auto bind = bind(server_socket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+        if (bind < 0) {
+            throw std::runtime_error(std::string("server bind failed: ") + std::strerror(errno));
+        }
+
+        if (listen(server_socket, SOMAXCONN) < 0) {
+            throw std::runtime_error(std::string("server listen failed: ") + std::strerror(errno));
+        }
+
+        return AcceptAwaitable(ring_, server_socket, buffer_size_, addr);
+    }
+};
+
+int main(int argc, char* argv[]) {
+    setup_signal_handlers();
+    io_uring_params params = {};
+    params.sq_thread_idle = 10000000;
+    params.flags |= IORING_SETUP_SQPOLL | IORING_SETUP_CQSIZE;
+    params.cq_entries = 64000;
+
+
+    Ring ring(params);
+
+    // benchmark(ring, 1000000);
+    auto provider = Provider(ring, 65535);
+
+
+    ring.start();
+
+    return 0;
 }
 //
 // template<typename T>
